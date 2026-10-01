@@ -222,6 +222,43 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn test_publish_fees_collected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        let owner = Address::generate(&env);
+        let pool_id: AssetId = 1;
+
+        env.as_contract(&contract_id, || {
+            publish_fees_collected(&env, &owner, pool_id, 1, 250, 250);
+
+            let events = env.events().all();
+            assert_eq!(events.len(), 1);
+
+            let (_, topics, data) = events.get(0).unwrap();
+            let expected_topics = soroban_sdk::vec![
+                &env,
+                Symbol::new(&env, "stellarflow").into_val(&env),
+                Symbol::new(&env, "fees_collected").into_val(&env),
+                pool_id.into_val(&env),
+                owner.clone().into_val(&env),
+            ];
+            assert_eq!(topics, expected_topics);
+
+            let payload = FeesCollectedEvent::try_from_val(&env, &data).unwrap();
+            assert_eq!(
+                payload,
+                FeesCollectedEvent {
+                    owner,
+                    pool_id,
+                    position_id: 1,
+                    accrued: 250,
+                    tokens_owed: 250,
+                }
+            );
+        });
+    }
 }
 
 /// Structured payload for the `position_split` event (Issue #986).
@@ -289,6 +326,55 @@ pub fn publish_position_split(
         lower_liquidity,
         upper_position_id,
         upper_liquidity,
+    };
+
+    env.events().publish(topics, payload);
+}
+
+/// Structured payload for the `fees_collected` event (Issue #936).
+///
+/// Duplicates the indexed owner and pool identifier in the payload so RPC
+/// consumers can filter on topics and still hydrate a self-contained record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeesCollectedEvent {
+    /// Address that owns the position whose fees were settled.
+    pub owner: Address,
+    /// Canonical corridor pool identifier used by the contract.
+    pub pool_id: AssetId,
+    /// Receipt id of the position whose fees were settled.
+    pub position_id: u64,
+    /// Fees newly accrued and minted into `tokens_owed` by this interaction.
+    pub accrued: u64,
+    /// The position's total `tokens_owed` balance after this settlement.
+    pub tokens_owed: u64,
+}
+
+/// Publishes a standardized `FeesCollectedEvent`.
+///
+/// Topics follow the RPC-friendly schema:
+/// `("stellarflow", "fees_collected", pool_id, owner)`.
+pub fn publish_fees_collected(
+    env: &Env,
+    owner: &Address,
+    pool_id: AssetId,
+    position_id: u64,
+    accrued: u64,
+    tokens_owed: u64,
+) {
+    let topics = (
+        Symbol::new(env, "stellarflow"),
+        Symbol::new(env, "fees_collected"),
+        pool_id,
+        owner.clone(),
+    );
+
+    let payload = FeesCollectedEvent {
+        owner: owner.clone(),
+        pool_id,
+        position_id,
+        accrued,
+        tokens_owed,
     };
 
     env.events().publish(topics, payload);

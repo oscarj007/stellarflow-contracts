@@ -119,6 +119,88 @@ pub fn get_position(env: &Env, position_id: u64) -> Result<Position, ContractErr
     get_position_record(env, position_id)
 }
 
+// ---------------------------------------------------------------------------
+// Fee growth distribution (Issue #936)
+// ---------------------------------------------------------------------------
+//
+// Realizes the issue's `Fee_uncollected = L_user * (f_upper - f_lower)`
+// formula via `ticks::get_fee_growth_inside`, which computes exactly that
+// difference (`f_upper`/`f_lower` there are the fee-growth-outside snapshots
+// at the range's boundary ticks; see `ticks.rs`'s module-level note).
+
+/// Compute the fee amount newly accrued to `position` since its last
+/// checkpoint, and the fee-growth-inside value to checkpoint against going
+/// forward. Pure — does not mutate `position` or storage.
+fn compute_fee_accrual(env: &Env, position: &Position) -> Result<(u64, u128), ContractError> {
+    let fee_growth_inside_now = ticks::get_fee_growth_inside(
+        env,
+        position.asset,
+        position.tick_lower,
+        position.tick_upper,
+    )?;
+    let fee_growth_delta = fee_growth_inside_now.wrapping_sub(position.fee_growth_inside_last);
+    let accrued = fee_growth_delta
+        .checked_mul(position.liquidity as u128)
+        .ok_or(ContractError::Overflow)?
+        / ticks::FEE_GROWTH_SCALE;
+    let accrued_u64 = u64::try_from(accrued).map_err(|_| ContractError::Overflow)?;
+    Ok((accrued_u64, fee_growth_inside_now))
+}
+
+/// Settle fee growth accrued since `position.fee_growth_inside_last` by
+/// minting it into `position.tokens_owed`, and checkpoint
+/// `fee_growth_inside_last` to the current fee-growth-inside value. Mutates
+/// `position` in place; the caller is responsible for persisting it.
+/// Returns the amount newly accrued (not the running total).
+fn settle_fees(env: &Env, position: &mut Position) -> Result<u64, ContractError> {
+    let (accrued, fee_growth_inside_now) = compute_fee_accrual(env, position)?;
+    position.tokens_owed = position
+        .tokens_owed
+        .checked_add(accrued)
+        .ok_or(ContractError::Overflow)?;
+    position.fee_growth_inside_last = fee_growth_inside_now;
+    Ok(accrued)
+}
+
+/// Preview the total fees owed to a position — already-settled
+/// `tokens_owed` plus whatever has accrued since its last checkpoint —
+/// without mutating any state.
+pub fn uncollected_fees(env: &Env, position_id: u64) -> Result<u64, ContractError> {
+    let position = get_position_record(env, position_id)?;
+    let (accrued, _) = compute_fee_accrual(env, &position)?;
+    position
+        .tokens_owed
+        .checked_add(accrued)
+        .ok_or(ContractError::Overflow)
+}
+
+/// Settle any fees this position has accrued since it was last touched,
+/// minting the owed amount directly into its `tokens_owed` balance. Callable
+/// by the position's owner to bring its fee accounting current — e.g. ahead
+/// of a future withdrawal — independent of splitting the range.
+pub fn collect_fees(env: &Env, caller: Address, position_id: u64) -> Result<Position, ContractError> {
+    caller.require_auth();
+
+    let mut position = get_position_record(env, position_id)?;
+    if position.owner != caller {
+        return Err(ContractError::Unauthorized);
+    }
+
+    let accrued = settle_fees(env, &mut position)?;
+    set_position_record(env, &position);
+
+    crate::events::publish_fees_collected(
+        env,
+        &position.owner,
+        position.asset,
+        position_id,
+        accrued,
+        position.tokens_owed,
+    );
+
+    Ok(position)
+}
+
 /// Open a new concentrated-liquidity range position, placing `liquidity` at
 /// both boundary ticks of `[tick_lower, tick_upper)` and minting a fresh
 /// position-receipt id to `owner`.
@@ -177,7 +259,7 @@ pub fn split_position(
 ) -> Result<SplitPositionResult, ContractError> {
     caller.require_auth();
 
-    let position = get_position_record(env, position_id)?;
+    let mut position = get_position_record(env, position_id)?;
     if position.owner != caller {
         return Err(ContractError::Unauthorized);
     }
@@ -190,22 +272,9 @@ pub fn split_position(
         return Err(ContractError::TickNotAligned);
     }
 
-    // ── Settle fees owed on the original range up to now ────────────────
-    let fee_growth_inside_now = ticks::get_fee_growth_inside(
-        env,
-        position.asset,
-        position.tick_lower,
-        position.tick_upper,
-    )?;
-    let fee_growth_delta = fee_growth_inside_now.wrapping_sub(position.fee_growth_inside_last);
-    let accrued = fee_growth_delta
-        .checked_mul(position.liquidity as u128)
-        .ok_or(ContractError::Overflow)?
-        / ticks::FEE_GROWTH_SCALE;
-    let total_owed_u128 = (position.tokens_owed as u128)
-        .checked_add(accrued)
-        .ok_or(ContractError::Overflow)?;
-    let total_owed = u64::try_from(total_owed_u128).map_err(|_| ContractError::Overflow)?;
+    // ── Settle fees owed on the original range up to now (Issue #936) ───
+    settle_fees(env, &mut position)?;
+    let total_owed = position.tokens_owed;
 
     // ── Proportional liquidity split by tick width ──────────────────────
     let width_total = (position.tick_upper - position.tick_lower) as u128;
@@ -560,5 +629,109 @@ mod tests {
         let result2 = split_position(&env2, owner2, position2.id, 0).unwrap();
         assert_eq!(result2.lower.liquidity, 250);
         assert_eq!(result2.upper.liquidity, 750);
+    }
+
+    // ── Fee collection (Issue #936) ─────────────────────────────────────
+
+    #[test]
+    fn uncollected_fees_is_zero_for_a_freshly_opened_position() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let asset: AssetId = 1;
+        setup_pool(&env, asset);
+        let owner = Address::generate(&env);
+
+        let position = open_position(&env, owner, asset, -10, 10, 1000).unwrap();
+        assert_eq!(uncollected_fees(&env, position.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn uncollected_fees_reflects_accrued_growth_without_mutating_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let asset: AssetId = 1;
+        setup_pool(&env, asset);
+        let owner = Address::generate(&env);
+
+        let position = open_position(&env, owner, asset, -10, 10, 1000).unwrap();
+        ticks::accrue_fee_growth(&env, asset, 1000).unwrap();
+
+        assert_eq!(uncollected_fees(&env, position.id).unwrap(), 1000);
+        // A second preview call must not change anything (pure query).
+        assert_eq!(uncollected_fees(&env, position.id).unwrap(), 1000);
+        let reloaded = get_position(&env, position.id).unwrap();
+        assert_eq!(reloaded.tokens_owed, 0);
+    }
+
+    #[test]
+    fn collect_fees_mints_into_tokens_owed_and_checkpoints() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let asset: AssetId = 1;
+        setup_pool(&env, asset);
+        let owner = Address::generate(&env);
+
+        let position = open_position(&env, owner.clone(), asset, -10, 10, 1000).unwrap();
+        ticks::accrue_fee_growth(&env, asset, 1000).unwrap();
+
+        let collected = collect_fees(&env, owner.clone(), position.id).unwrap();
+        assert_eq!(collected.tokens_owed, 1000);
+
+        // Collecting again immediately (no new accrual) must not double-count.
+        let collected_again = collect_fees(&env, owner.clone(), position.id).unwrap();
+        assert_eq!(collected_again.tokens_owed, 1000);
+
+        // Further accrual is picked up on the next collection only.
+        ticks::accrue_fee_growth(&env, asset, 500).unwrap();
+        let collected_more = collect_fees(&env, owner, position.id).unwrap();
+        assert_eq!(collected_more.tokens_owed, 1500);
+    }
+
+    #[test]
+    fn collect_fees_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let asset: AssetId = 1;
+        setup_pool(&env, asset);
+        let owner = Address::generate(&env);
+        let intruder = Address::generate(&env);
+
+        let position = open_position(&env, owner, asset, -10, 10, 1000).unwrap();
+        assert_eq!(
+            collect_fees(&env, intruder, position.id),
+            Err(ContractError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn collect_fees_rejects_unknown_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+
+        assert_eq!(
+            collect_fees(&env, owner, 999),
+            Err(ContractError::PositionNotFound)
+        );
+    }
+
+    #[test]
+    fn split_position_uses_the_same_settlement_as_collect_fees() {
+        // Splitting settles fees via the same `settle_fees` path as
+        // `collect_fees`, so the total owed across the two resulting
+        // positions must equal what a plain `collect_fees` on the original
+        // position would have reported as uncollected.
+        let env = Env::default();
+        env.mock_all_auths();
+        let asset: AssetId = 1;
+        setup_pool(&env, asset);
+        let owner = Address::generate(&env);
+
+        let position = open_position(&env, owner.clone(), asset, -10, 10, 1000).unwrap();
+        ticks::accrue_fee_growth(&env, asset, 1000).unwrap();
+        let expected = uncollected_fees(&env, position.id).unwrap();
+
+        let result = split_position(&env, owner, position.id, 0).unwrap();
+        assert_eq!(result.lower.tokens_owed + result.upper.tokens_owed, expected);
     }
 }
