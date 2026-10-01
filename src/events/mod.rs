@@ -5,8 +5,9 @@ pub mod swaps;
 
 pub use events::*;
 pub use liquidity::{
-    publish_liquidity_added, publish_liquidity_removed, publish_position_split,
-    LiquidityAddedEvent, LiquidityRemovedEvent, PositionSplitEvent,
+    publish_fees_collected, publish_liquidity_added, publish_liquidity_removed,
+    publish_position_split, FeesCollectedEvent, LiquidityAddedEvent, LiquidityRemovedEvent,
+    PositionSplitEvent,
 };
 pub use swaps::{publish_swap_executed, SwapExecutedEvent};
 

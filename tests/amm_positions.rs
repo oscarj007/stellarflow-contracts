@@ -98,3 +98,38 @@ fn split_position_apportions_accrued_fees_and_preserves_pool_liquidity() {
         assert_eq!(meta.active_liquidity, 500);
     });
 }
+
+#[test]
+fn collect_fees_through_the_contract_client_mints_into_tokens_owed() {
+    let (env, client, _admin) = setup();
+    client.amm_initialize_tick_pool(&POOL, &1);
+
+    let owner = Address::generate(&env);
+    let position = client.amm_open_position(&owner, &POOL, &-10, &10, &1000);
+    assert_eq!(client.amm_uncollected_fees(&position.id), 0);
+
+    env.as_contract(&client.address, || {
+        stellarflow_contracts::amm::ticks::accrue_fee_growth(&env, POOL, 1000).unwrap();
+    });
+
+    assert_eq!(client.amm_uncollected_fees(&position.id), 1000);
+
+    let collected = client.amm_collect_fees(&owner, &position.id);
+    assert_eq!(collected.tokens_owed, 1000);
+
+    // Already settled; nothing new accrued since.
+    assert_eq!(client.amm_uncollected_fees(&position.id), 1000);
+}
+
+#[test]
+fn collect_fees_rejects_a_caller_who_is_not_the_owner() {
+    let (env, client, _admin) = setup();
+    client.amm_initialize_tick_pool(&POOL, &1);
+
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let position = client.amm_open_position(&owner, &POOL, &-10, &10, &1000);
+
+    let result = client.try_amm_collect_fees(&intruder, &position.id);
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+}

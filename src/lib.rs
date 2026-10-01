@@ -2182,6 +2182,26 @@ impl TimeLockedUpgradeContract {
         amm::positions::get_position(&env, position_id)
     }
 
+    /// Preview a position's total uncollected fees (already-settled
+    /// `tokens_owed` plus whatever has accrued since its last checkpoint)
+    /// without mutating any state (Issue #936).
+    pub fn amm_uncollected_fees(env: Env, position_id: u64) -> Result<u64, ContractError> {
+        amm::positions::uncollected_fees(&env, position_id)
+    }
+
+    /// Settle a position's accrued fees, minting the owed amount directly
+    /// into its `tokens_owed` balance (Issue #936). Callable independently
+    /// of splitting the range, e.g. to bring accounting current ahead of a
+    /// future withdrawal.
+    pub fn amm_collect_fees(
+        env: Env,
+        caller: Address,
+        position_id: u64,
+    ) -> Result<amm::positions::Position, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        amm::positions::collect_fees(&env, caller, position_id)
+    }
+
     /// Tick-volume market matcher (Issue #915): sweep the book by price/time
     /// priority, update `V_tick`, and transfer assets maker↔taker.
     pub fn match_market_order(
